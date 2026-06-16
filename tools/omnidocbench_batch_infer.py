@@ -315,15 +315,20 @@ def main() -> None:
     log_path = args.output_dir / "inference_log.jsonl"
     images = collect_images(args.input_dir, args.filelist, args.manifest, args.limit)
 
+    run_started = time.time()
     converter = build_converter(args)
+    converter_init_seconds = time.time() - run_started
     total = len(images)
     successes = 0
     failures = 0
+    skipped = 0
+    page_seconds_sum = 0.0
 
     for idx, image_path in enumerate(images, start=1):
         target_path = output_path_for(image_path, args.output_dir)
         if target_path.exists() and target_path.stat().st_size > 0 and not args.overwrite:
             successes += 1
+            skipped += 1
             write_log(log_path, {"image": image_path.name, "status": "skipped", "output": str(target_path)})
             print(f"[{idx}/{total}] skip {image_path.name}")
             continue
@@ -333,6 +338,8 @@ def main() -> None:
         try:
             markdown = converter(image_path)
             target_path.write_text(markdown, encoding="utf-8")
+            page_seconds = time.time() - started
+            page_seconds_sum += page_seconds
             successes += 1
             write_log(
                 log_path,
@@ -340,11 +347,13 @@ def main() -> None:
                     "image": image_path.name,
                     "status": "success",
                     "output": str(target_path),
-                    "seconds": round(time.time() - started, 3),
+                    "seconds": round(page_seconds, 3),
                     "chars": len(markdown),
                 },
             )
         except Exception as exc:
+            page_seconds = time.time() - started
+            page_seconds_sum += page_seconds
             failures += 1
             if args.write_empty_on_error:
                 target_path.write_text("", encoding="utf-8")
@@ -354,20 +363,28 @@ def main() -> None:
                     "image": image_path.name,
                     "status": "failed",
                     "output": str(target_path) if target_path.exists() else "",
-                    "seconds": round(time.time() - started, 3),
+                    "seconds": round(page_seconds, 3),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 },
             )
             print(f"ERROR {image_path.name}: {type(exc).__name__}: {exc}", flush=True)
 
+    wall_seconds = time.time() - run_started
+    processed = successes + failures - skipped
     success_rate = successes / total
     summary = {
         "engine": args.engine,
         "total": total,
         "successes": successes,
         "failures": failures,
+        "skipped": skipped,
         "success_rate": success_rate,
+        "converter_init_seconds": round(converter_init_seconds, 3),
+        "page_seconds_sum": round(page_seconds_sum, 3),
+        "wall_seconds": round(wall_seconds, 3),
+        "pages_per_minute": None if wall_seconds <= 0 else round((successes / wall_seconds) * 60.0, 6),
+        "processed_pages_per_minute": None if page_seconds_sum <= 0 else round((processed / page_seconds_sum) * 60.0, 6),
         "output_dir": str(args.output_dir),
         "log": str(log_path),
     }

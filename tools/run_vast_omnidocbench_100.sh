@@ -102,6 +102,10 @@ timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+epoch_seconds() {
+  date -u +"%s"
+}
+
 subset_ready() {
   [[ -f "$SUBSET_JSON" && -f "$MANIFEST" && -d "$SUBSET_IMAGES" ]]
 }
@@ -254,6 +258,10 @@ run_engine() {
       if [[ "$RESOLVED_NO_CDM" == "1" ]]; then
         cdm_flag=(--no-cdm)
       fi
+      local eval_started
+      local eval_finished
+      local eval_seconds
+      eval_started="$(epoch_seconds)"
       "$EVAL_PYTHON" skills/scripts/generate_end2end_config.py \
         --gt "$SUBSET_JSON" \
         --pred "$pred_dir" \
@@ -263,12 +271,25 @@ run_engine() {
       "$EVAL_PYTHON" pdf_validation.py --config "$config_path" 2>&1 | tee "$eval_dir/eval.log" || return $?
       "$EVAL_PYTHON" skills/scripts/parse_results.py "$REPO_ROOT/result" --prefix "$prefix" --pred "$pred_dir" | tee "$eval_dir/report.md" || return $?
       find "$REPO_ROOT/result" -maxdepth 1 -type f -name "${prefix}*" -exec cp {} "$eval_dir/" \; || return $?
+      eval_finished="$(epoch_seconds)"
+      eval_seconds="$((eval_finished - eval_started))"
+      {
+        echo "{"
+        echo "  \"engine\": \"$engine\","
+        echo "  \"eval_started\": $eval_started,"
+        echo "  \"eval_finished\": $eval_finished,"
+        echo "  \"eval_seconds\": $eval_seconds,"
+        echo "  \"no_cdm\": $RESOLVED_NO_CDM,"
+        echo "  \"workers\": $EVAL_WORKERS"
+        echo "}"
+      } > "$eval_dir/eval_timing.json"
       {
         echo "timestamp=$(timestamp)"
         echo "engine=$engine"
         echo "eval_dir=$eval_dir"
         echo "config=$config_path"
         echo "no_cdm=$RESOLVED_NO_CDM"
+        echo "eval_seconds=$eval_seconds"
       } > "$eval_done"
     fi
   fi
