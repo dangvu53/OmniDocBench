@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Run page-image-to-Markdown inference for OmniDocBench-compatible outputs."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+DEFAULT_MODELS = {
+    "lighton_bbox": "lightonai/LightOnOCR-2-1B-bbox",
+    "chandra": "datalab-to/chandra-ocr-2",
+}
+
+
+class EngineError(RuntimeError):
+    """Raised when an inference engine cannot be initialized or run."""
+
+
+def read_filelist(path: Path) -> list[str]:
+    names = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                names.append(os.path.basename(stripped))
+    return names
+
+
+def read_manifest_basenames(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if "basename" not in (reader.fieldnames or []):
+            raise SystemExit(f"{path} must contain a 'basename' column")
+        return [row["basename"] for row in reader if row.get("basename")]
+
+
+def collect_images(input_dir: Path, filelist: Path | None, manifest: Path | None, limit: int | None) -> list[Path]:
+    if filelist and manifest:
+        raise SystemExit("Use only one of --filelist or --manifest")
+
+    if manifest:
+        basenames = read_manifest_basenames(manifest)
+    elif filelist:
+        basenames = read_filelist(filelist)
+    else:
+        basenames = sorted(path.name for path in input_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
+
+    images = [input_dir / name for name in basenames]
+    missing = [str(path) for path in images if not path.is_file()]
+    if missing:
+        raise SystemExit(f"Missing {len(missing)} images. Examples: {', '.join(missing[:10])}")
+
+    if limit is not None:
+        images = images[:limit]
+    if not images:
+        raise SystemExit(f"No images found in {input_dir}")
+    return images
+
+
+def clean_markdown(text: str) -> str:
+    stripped = text.strip()
+    for fence in ("```markdown", "```md", "```"):
+        if stripped.startswith(fence) and stripped.endswith("```"):
+            stripped = stripped[len(fence) : -3].strip()
+            break
+    return stripped
+
+
+def output_path_for(image_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{image_path.stem}.md"
+
+
+def harvest_markdown(search_root: Path, preferred_stem: str) -> str:
+    md_files = sorted(search_root.rglob("*.md"))
+    if not md_files:
+        raise EngineError(f"No Markdown output found under {search_root}")
+
+    preferred = [path for path in md_files if path.stem == preferred_stem]
+    chosen = preferred[0] if preferred else max(md_files, key=lambda path: path.stat().st_size)
+    return chosen.read_text(encoding="utf-8")
+
+
+def build_marker_converter(_: argparse.Namespace) -> Callable[[Path], str]:
+    try:
+        from marker.converters.pdf import PdfConverter
+        from marker.models import create_model_dict
+        from marker.output import text_from_rendered
+    except ImportError as exc:
+        raise EngineError("Marker is not installed. Install with: pip install marker-pdf") from exc
+
+    converter = PdfConverter(artifact_dict=create_model_dict())
+
+    def convert(image_path: Path) -> str:
+        rendered = converter(str(image_path))
+        text, _, _ = text_from_rendered(rendered)
+        return clean_markdown(text)
+
+    return convert
+
+
+def build_docling_converter(_: argparse.Namespace) -> Callable[[Path], str]:
+    try:
+        from docling.document_converter import DocumentConverter
+    except ImportError as exc:
+        raise EngineError("Docling is not installed. Install with: pip install docling") from exc
+
+    converter = DocumentConverter()
+
+    def convert(image_path: Path) -> str:
+        result = converter.convert(str(image_path))
+        return clean_markdown(result.document.export_to_markdown())
+
+    return convert
+
+
+def build_paddleocr_vl15_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    try:
+        from paddleocr import PaddleOCRVL
+    except ImportError as exc:
+        if shutil.which("paddleocr"):
+            return build_paddleocr_cli_converter(args)
+        raise EngineError(
+            'PaddleOCR-VL is not installed. Install with: python -m pip install -U "paddleocr[doc-parser]"'
+        ) from exc
+
+    kwargs: dict[str, object] = {"pipeline_version": args.paddle_pipeline_version}
+    if args.device != "auto":
+        kwargs["device"] = args.device
+    if args.paddle_engine:
+        kwargs["engine"] = args.paddle_engine
+    pipeline = PaddleOCRVL(**kwargs)
+
+    def convert(image_path: Path) -> str:
+        with tempfile.TemporaryDirectory(prefix=f"paddle_{image_path.stem}_") as tmp:
+            tmp_path = Path(tmp)
+            output = pipeline.predict(
+                str(image_path),
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+            )
+            for res in output:
+                res.save_to_markdown(save_path=str(tmp_path), pretty=False)
+            return clean_markdown(harvest_markdown(tmp_path, image_path.stem))
+
+    return convert
+
+
+def build_paddleocr_cli_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    def convert(image_path: Path) -> str:
+        with tempfile.TemporaryDirectory(prefix=f"paddle_cli_{image_path.stem}_") as tmp:
+            cmd = [
+                "paddleocr",
+                "doc_parser",
+                "-i",
+                str(image_path),
+                "--save_path",
+                tmp,
+                "--pipeline_version",
+                args.paddle_pipeline_version,
+            ]
+            if args.paddle_engine:
+                cmd.extend(["--engine", args.paddle_engine])
+            subprocess.run(cmd, check=True, text=True, capture_output=True)
+            return clean_markdown(harvest_markdown(Path(tmp), image_path.stem))
+
+    return convert
+
+
+def torch_dtype_for_device(torch_module: object, device: str) -> object:
+    if device == "cuda":
+        return getattr(torch_module, "bfloat16")
+    return getattr(torch_module, "float32")
+
+
+def build_lighton_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    model_id = args.model_id or DEFAULT_MODELS["lighton_bbox"]
+    try:
+        import torch
+        from PIL import Image
+        from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
+    except ImportError as exc:
+        raise EngineError(
+            "LightOnOCR requires transformers from source plus torch and Pillow. "
+            "Install with: pip install git+https://github.com/huggingface/transformers pillow"
+        ) from exc
+
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    if device == "auto":
+        device = "cpu"
+    dtype = torch_dtype_for_device(torch, device)
+    model = LightOnOcrForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    processor = LightOnOcrProcessor.from_pretrained(model_id)
+    model.eval()
+
+    def convert(image_path: Path) -> str:
+        image = Image.open(image_path).convert("RGB")
+        conversation = [{"role": "user", "content": [{"type": "image", "image": image}]}]
+        inputs = processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {
+            key: value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device)
+            for key, value in inputs.items()
+        }
+        with torch.inference_mode():
+            output_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
+        generated_ids = output_ids[0, inputs["input_ids"].shape[1] :]
+        return clean_markdown(processor.decode(generated_ids, skip_special_tokens=True))
+
+    return convert
+
+
+def from_pretrained_image_text_model(model_cls: object, model_id: str, torch_module: object) -> object:
+    try:
+        return model_cls.from_pretrained(model_id, dtype=getattr(torch_module, "bfloat16"), device_map="auto")
+    except TypeError:
+        return model_cls.from_pretrained(model_id, torch_dtype=getattr(torch_module, "bfloat16"), device_map="auto")
+
+
+def build_chandra_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    model_id = args.model_id or DEFAULT_MODELS["chandra"]
+    try:
+        import torch
+        from PIL import Image
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        from chandra.model.hf import generate_hf
+        from chandra.model.schema import BatchInputItem
+        from chandra.output import parse_markdown
+    except ImportError as exc:
+        raise EngineError("Chandra HF inference is not installed. Install with: pip install 'chandra-ocr[hf]'") from exc
+
+    model = from_pretrained_image_text_model(AutoModelForImageTextToText, model_id, torch)
+    model.eval()
+    model.processor = AutoProcessor.from_pretrained(model_id)
+    model.processor.tokenizer.padding_side = "left"
+
+    def convert(image_path: Path) -> str:
+        batch = [
+            BatchInputItem(
+                image=Image.open(image_path).convert("RGB"),
+                prompt_type=args.chandra_prompt_type,
+            )
+        ]
+        with torch.inference_mode():
+            try:
+                result = generate_hf(batch, model, max_output_tokens=args.max_new_tokens)[0]
+            except TypeError:
+                result = generate_hf(batch, model)[0]
+        return clean_markdown(parse_markdown(result.raw))
+
+    return convert
+
+
+def build_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    if args.engine == "marker":
+        return build_marker_converter(args)
+    if args.engine == "docling":
+        return build_docling_converter(args)
+    if args.engine == "paddleocr_vl15":
+        return build_paddleocr_vl15_converter(args)
+    if args.engine == "lighton_bbox":
+        return build_lighton_converter(args)
+    if args.engine == "chandra":
+        return build_chandra_converter(args)
+    raise SystemExit(f"Unsupported engine: {args.engine}")
+
+
+def write_log(log_path: Path, record: dict[str, object]) -> None:
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run a document parser over OmniDocBench page images.")
+    parser.add_argument(
+        "--engine",
+        required=True,
+        choices=("marker", "docling", "paddleocr_vl15", "lighton_bbox", "chandra"),
+    )
+    parser.add_argument("--input-dir", required=True, type=Path, help="Directory containing selected page images")
+    parser.add_argument("--output-dir", required=True, type=Path, help="Directory for OmniDocBench .md predictions")
+    parser.add_argument("--filelist", type=Path, help="Optional text file of image basenames to process")
+    parser.add_argument("--manifest", type=Path, help="Optional subset manifest.csv with a basename column")
+    parser.add_argument("--limit", type=int, help="Process only the first N images")
+    parser.add_argument("--overwrite", action="store_true", help="Regenerate existing markdown files")
+    parser.add_argument("--write-empty-on-error", action="store_true", help="Write an empty .md if a page fails")
+    parser.add_argument("--min-success-rate", type=float, default=0.95, help="Fail if success rate is below this value")
+    parser.add_argument("--device", default="auto", help="auto, cuda, cpu, gpu:0, etc., depending on engine")
+    parser.add_argument("--model-id", help="Override model ID for LightOn or Chandra")
+    parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument("--paddle-pipeline-version", default="v1.5")
+    parser.add_argument("--paddle-engine", default="", help="Optional PaddleOCR engine, e.g. paddle or transformers")
+    parser.add_argument("--chandra-prompt-type", default="ocr_layout")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = args.output_dir / "inference_log.jsonl"
+    images = collect_images(args.input_dir, args.filelist, args.manifest, args.limit)
+
+    converter = build_converter(args)
+    total = len(images)
+    successes = 0
+    failures = 0
+
+    for idx, image_path in enumerate(images, start=1):
+        target_path = output_path_for(image_path, args.output_dir)
+        if target_path.exists() and target_path.stat().st_size > 0 and not args.overwrite:
+            successes += 1
+            write_log(log_path, {"image": image_path.name, "status": "skipped", "output": str(target_path)})
+            print(f"[{idx}/{total}] skip {image_path.name}")
+            continue
+
+        started = time.time()
+        print(f"[{idx}/{total}] {args.engine} {image_path.name}", flush=True)
+        try:
+            markdown = converter(image_path)
+            target_path.write_text(markdown, encoding="utf-8")
+            successes += 1
+            write_log(
+                log_path,
+                {
+                    "image": image_path.name,
+                    "status": "success",
+                    "output": str(target_path),
+                    "seconds": round(time.time() - started, 3),
+                    "chars": len(markdown),
+                },
+            )
+        except Exception as exc:
+            failures += 1
+            if args.write_empty_on_error:
+                target_path.write_text("", encoding="utf-8")
+            write_log(
+                log_path,
+                {
+                    "image": image_path.name,
+                    "status": "failed",
+                    "output": str(target_path) if target_path.exists() else "",
+                    "seconds": round(time.time() - started, 3),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            print(f"ERROR {image_path.name}: {type(exc).__name__}: {exc}", flush=True)
+
+    success_rate = successes / total
+    summary = {
+        "engine": args.engine,
+        "total": total,
+        "successes": successes,
+        "failures": failures,
+        "success_rate": success_rate,
+        "output_dir": str(args.output_dir),
+        "log": str(log_path),
+    }
+    (args.output_dir / "inference_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2), flush=True)
+
+    if success_rate < args.min_success_rate:
+        raise SystemExit(
+            f"{args.engine} success rate {success_rate:.3f} is below --min-success-rate {args.min_success_rate:.3f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
