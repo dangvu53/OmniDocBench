@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import base64
 import json
 import os
 import shutil
@@ -19,7 +20,14 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 DEFAULT_MODELS = {
     "lighton_bbox": "lightonai/LightOnOCR-2-1B-bbox",
     "chandra": "datalab-to/chandra-ocr-2",
+    "mineru25": "opendatalab/MinerU2.5-2509-1.2B",
+    "mineru25pro": "opendatalab/MinerU2.5-Pro-2605-1.2B",
+    "kdl_frontier_nano": "KDLAI/KDL-Frontier-Parser-nano",
 }
+DEFAULT_KDL_PROMPT = (
+    "Parse this document page into clean Markdown. Preserve reading order, headings, paragraphs, tables, "
+    "lists, equations, and visible captions. Return only Markdown without commentary."
+)
 
 
 class EngineError(RuntimeError):
@@ -266,6 +274,202 @@ def build_chandra_converter(args: argparse.Namespace) -> Callable[[Path], str]:
     return convert
 
 
+def build_mineru_vllm_client(args: argparse.Namespace, model_id: str) -> object:
+    try:
+        from mineru_vl_utils import MinerUClient
+        from vllm import LLM
+    except ImportError as exc:
+        raise EngineError(
+            'MinerU vLLM inference is not installed. Install with: pip install -U "mineru-vl-utils[vllm]"'
+        ) from exc
+
+    llm_kwargs: dict[str, object] = {
+        "model": model_id,
+        "tensor_parallel_size": args.mineru_tensor_parallel_size,
+    }
+    if args.mineru_gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = args.mineru_gpu_memory_utilization
+    if args.mineru_max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.mineru_max_model_len
+
+    try:
+        from mineru_vl_utils import MinerULogitsProcessor
+
+        llm_kwargs["logits_processors"] = [MinerULogitsProcessor]
+    except ImportError:
+        pass
+
+    try:
+        llm = LLM(**llm_kwargs)
+    except TypeError:
+        if "logits_processors" not in llm_kwargs:
+            raise
+        llm_kwargs.pop("logits_processors")
+        llm = LLM(**llm_kwargs)
+    return MinerUClient(
+        backend="vllm-engine",
+        vllm_llm=llm,
+        image_analysis=args.mineru_image_analysis,
+    )
+
+
+def build_mineru_transformers_client(args: argparse.Namespace, model_id: str) -> object:
+    try:
+        from mineru_vl_utils import MinerUClient
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    except ImportError as exc:
+        raise EngineError(
+            'MinerU transformers inference is not installed. Install with: pip install -U "mineru-vl-utils[transformers]"'
+        ) from exc
+
+    try:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, dtype="auto", device_map="auto")
+    except TypeError:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+    processor = AutoProcessor.from_pretrained(model_id, use_fast=True)
+    return MinerUClient(
+        backend="transformers",
+        model=model,
+        processor=processor,
+        image_analysis=args.mineru_image_analysis,
+    )
+
+
+def build_mineru_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    model_id = args.model_id or DEFAULT_MODELS[args.engine]
+    try:
+        from PIL import Image
+        from mineru_vl_utils.post_process import json2md
+    except ImportError as exc:
+        raise EngineError(
+            "MinerU utilities are not installed. Install with the vLLM or transformers extra for your backend."
+        ) from exc
+
+    if args.mineru_backend == "vllm-engine":
+        client = build_mineru_vllm_client(args, model_id)
+    elif args.mineru_backend == "transformers":
+        client = build_mineru_transformers_client(args, model_id)
+    else:
+        raise EngineError(f"Unsupported MinerU backend: {args.mineru_backend}")
+
+    def convert(image_path: Path) -> str:
+        image = Image.open(image_path).convert("RGB")
+        content_list = client.two_step_extract(image)
+        return clean_markdown(json2md(content_list))
+
+    return convert
+
+
+def build_kdl_transformers_converter(args: argparse.Namespace, model_id: str) -> Callable[[Path], str]:
+    try:
+        import torch
+        from PIL import Image
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    except ImportError as exc:
+        raise EngineError(
+            "KDL transformers inference requires torch, Pillow, and transformers with Qwen2-VL support."
+        ) from exc
+
+    try:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    except TypeError:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model.eval()
+
+    def convert(image_path: Path) -> str:
+        image = Image.open(image_path).convert("RGB")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": args.kdl_prompt},
+                ],
+            }
+        ]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image], return_tensors="pt")
+        inputs = {key: value.to(model.device) for key, value in inputs.items()}
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+            )
+        generated_ids = output_ids[0, inputs["input_ids"].shape[1] :]
+        return clean_markdown(processor.decode(generated_ids, skip_special_tokens=True))
+
+    return convert
+
+
+def image_to_data_url(image_path: Path) -> str:
+    suffix = image_path.suffix.lower()
+    mime = "image/png" if suffix == ".png" else "image/jpeg"
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def build_kdl_openai_converter(args: argparse.Namespace, model_id: str) -> Callable[[Path], str]:
+    try:
+        import requests
+    except ImportError as exc:
+        raise EngineError("KDL OpenAI-compatible inference requires requests. Install with: pip install requests") from exc
+
+    if not args.kdl_api_base:
+        raise EngineError("--kdl-api-base is required when --kdl-backend openai")
+    api_base = args.kdl_api_base.rstrip("/")
+    if api_base.endswith("/v1"):
+        url = f"{api_base}/chat/completions"
+    else:
+        url = f"{api_base}/v1/chat/completions"
+
+    headers = {"Content-Type": "application/json"}
+    if args.kdl_api_key:
+        headers["Authorization"] = f"Bearer {args.kdl_api_key}"
+
+    def convert(image_path: Path) -> str:
+        payload = {
+            "model": args.kdl_served_model_name or model_id,
+            "temperature": 0,
+            "max_tokens": args.max_new_tokens,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": args.kdl_prompt},
+                        {"type": "image_url", "image_url": {"url": image_to_data_url(image_path)}},
+                    ],
+                }
+            ],
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=args.kdl_timeout)
+        response.raise_for_status()
+        data = response.json()
+        return clean_markdown(data["choices"][0]["message"]["content"])
+
+    return convert
+
+
+def build_kdl_converter(args: argparse.Namespace) -> Callable[[Path], str]:
+    model_id = args.model_id or DEFAULT_MODELS["kdl_frontier_nano"]
+    if args.kdl_backend == "transformers":
+        return build_kdl_transformers_converter(args, model_id)
+    if args.kdl_backend == "openai":
+        return build_kdl_openai_converter(args, model_id)
+    raise EngineError(f"Unsupported KDL backend: {args.kdl_backend}")
+
+
 def build_converter(args: argparse.Namespace) -> Callable[[Path], str]:
     if args.engine == "marker":
         return build_marker_converter(args)
@@ -277,6 +481,10 @@ def build_converter(args: argparse.Namespace) -> Callable[[Path], str]:
         return build_lighton_converter(args)
     if args.engine == "chandra":
         return build_chandra_converter(args)
+    if args.engine in {"mineru25", "mineru25pro"}:
+        return build_mineru_converter(args)
+    if args.engine == "kdl_frontier_nano":
+        return build_kdl_converter(args)
     raise SystemExit(f"Unsupported engine: {args.engine}")
 
 
@@ -290,7 +498,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine",
         required=True,
-        choices=("marker", "docling", "paddleocr_vl15", "lighton_bbox", "chandra"),
+        choices=(
+            "marker",
+            "docling",
+            "paddleocr_vl15",
+            "lighton_bbox",
+            "chandra",
+            "mineru25",
+            "mineru25pro",
+            "kdl_frontier_nano",
+        ),
     )
     parser.add_argument("--input-dir", required=True, type=Path, help="Directory containing selected page images")
     parser.add_argument("--output-dir", required=True, type=Path, help="Directory for OmniDocBench .md predictions")
@@ -306,6 +523,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paddle-pipeline-version", default="v1.5")
     parser.add_argument("--paddle-engine", default="", help="Optional PaddleOCR engine, e.g. paddle or transformers")
     parser.add_argument("--chandra-prompt-type", default="ocr_layout")
+    parser.add_argument("--mineru-backend", choices=("vllm-engine", "transformers"), default="vllm-engine")
+    parser.add_argument("--mineru-image-analysis", action="store_true", help="Enable MinerU image/chart analysis")
+    parser.add_argument("--mineru-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--mineru-gpu-memory-utilization", type=float)
+    parser.add_argument("--mineru-max-model-len", type=int)
+    parser.add_argument("--kdl-backend", choices=("transformers", "openai"), default="transformers")
+    parser.add_argument("--kdl-prompt", default=DEFAULT_KDL_PROMPT)
+    parser.add_argument("--kdl-api-base", help="OpenAI-compatible server base URL, e.g. http://127.0.0.1:8000")
+    parser.add_argument("--kdl-api-key")
+    parser.add_argument("--kdl-served-model-name", default="kdl-frontier-parser-nano")
+    parser.add_argument("--kdl-timeout", type=int, default=300)
     return parser.parse_args()
 
 

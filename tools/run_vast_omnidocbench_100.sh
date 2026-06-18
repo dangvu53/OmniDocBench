@@ -11,6 +11,7 @@ set -euo pipefail
 #   RUN_ROOT=$PWD/runs/omnidocbench_100_YYYYmmdd_HHMMSS
 #   ENGINES="marker docling paddleocr_vl15 lighton_bbox chandra"
 #   ENGINE=marker      # shortcut for running exactly one model
+#                    # supported: marker, docling, paddleocr_vl15, lighton_bbox, chandra, mineru25, mineru25pro, kdl_frontier_nano
 #   SAMPLE_COUNT=100
 #   EVAL_WORKERS=4
 #   NO_CDM=auto       # auto, 0, or 1
@@ -51,6 +52,8 @@ PY_DOCLING="${PY_DOCLING:-python3}"
 PY_PADDLE="${PY_PADDLE:-python3}"
 PY_LIGHTON="${PY_LIGHTON:-python3}"
 PY_CHANDRA="${PY_CHANDRA:-python3}"
+PY_MINERU="${PY_MINERU:-python3}"
+PY_KDL="${PY_KDL:-python3}"
 
 MARKER_TORCH_DEVICE="${MARKER_TORCH_DEVICE:-cuda}"
 PADDLE_DEVICE="${PADDLE_DEVICE:-gpu:0}"
@@ -61,6 +64,19 @@ LIGHTON_DEVICE="${LIGHTON_DEVICE:-auto}"
 CHANDRA_MODEL_ID="${CHANDRA_MODEL_ID:-datalab-to/chandra-ocr-2}"
 CHANDRA_DEVICE="${CHANDRA_DEVICE:-auto}"
 CHANDRA_PROMPT_TYPE="${CHANDRA_PROMPT_TYPE:-ocr_layout}"
+MINERU_MODEL_ID="${MINERU_MODEL_ID:-}"
+MINERU_BACKEND="${MINERU_BACKEND:-vllm-engine}"
+MINERU_IMAGE_ANALYSIS="${MINERU_IMAGE_ANALYSIS:-0}"
+MINERU_TENSOR_PARALLEL_SIZE="${MINERU_TENSOR_PARALLEL_SIZE:-1}"
+MINERU_GPU_MEMORY_UTILIZATION="${MINERU_GPU_MEMORY_UTILIZATION:-}"
+MINERU_MAX_MODEL_LEN="${MINERU_MAX_MODEL_LEN:-}"
+KDL_MODEL_ID="${KDL_MODEL_ID:-KDLAI/KDL-Frontier-Parser-nano}"
+KDL_BACKEND="${KDL_BACKEND:-transformers}"
+KDL_API_BASE="${KDL_API_BASE:-}"
+KDL_API_KEY="${KDL_API_KEY:-}"
+KDL_SERVED_MODEL_NAME="${KDL_SERVED_MODEL_NAME:-kdl-frontier-parser-nano}"
+KDL_TIMEOUT="${KDL_TIMEOUT:-300}"
+KDL_PROMPT="${KDL_PROMPT:-}"
 
 if [[ -n "$ENGINE" ]]; then
   ENGINES="$ENGINE"
@@ -216,6 +232,35 @@ run_engine() {
     chandra)
       engine_py="$PY_CHANDRA"
       args+=(--model-id "$CHANDRA_MODEL_ID" --device "$CHANDRA_DEVICE" --chandra-prompt-type "$CHANDRA_PROMPT_TYPE")
+      ;;
+    mineru25|mineru25pro)
+      engine_py="$PY_MINERU"
+      args+=(--mineru-backend "$MINERU_BACKEND" --mineru-tensor-parallel-size "$MINERU_TENSOR_PARALLEL_SIZE")
+      if [[ -n "$MINERU_MODEL_ID" ]]; then
+        args+=(--model-id "$MINERU_MODEL_ID")
+      fi
+      if [[ "$MINERU_IMAGE_ANALYSIS" == "1" ]]; then
+        args+=(--mineru-image-analysis)
+      fi
+      if [[ -n "$MINERU_GPU_MEMORY_UTILIZATION" ]]; then
+        args+=(--mineru-gpu-memory-utilization "$MINERU_GPU_MEMORY_UTILIZATION")
+      fi
+      if [[ -n "$MINERU_MAX_MODEL_LEN" ]]; then
+        args+=(--mineru-max-model-len "$MINERU_MAX_MODEL_LEN")
+      fi
+      ;;
+    kdl_frontier_nano)
+      engine_py="$PY_KDL"
+      args+=(--model-id "$KDL_MODEL_ID" --kdl-backend "$KDL_BACKEND" --kdl-served-model-name "$KDL_SERVED_MODEL_NAME" --kdl-timeout "$KDL_TIMEOUT")
+      if [[ -n "$KDL_API_BASE" ]]; then
+        args+=(--kdl-api-base "$KDL_API_BASE")
+      fi
+      if [[ -n "$KDL_API_KEY" ]]; then
+        args+=(--kdl-api-key "$KDL_API_KEY")
+      fi
+      if [[ -n "$KDL_PROMPT" ]]; then
+        args+=(--kdl-prompt "$KDL_PROMPT")
+      fi
       ;;
     *)
       echo "Unknown engine: $engine" >&2
